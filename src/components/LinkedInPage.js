@@ -1,23 +1,59 @@
-import React, { useState, useEffect, useCallback, useContext } from "react";
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, TextInput, Alert } from "react-native";
-import { useRouter } from "expo-router";
+import React, { useState, useEffect, useCallback, useContext, useRef } from "react";
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, TextInput, Alert, Animated } from "react-native";
+import { useRouter, useLocalSearchParams } from "expo-router";
 import { ThemeContext } from "../lib/theme";
 import { useStudent } from "../lib/student-context";
 import { usePermissions } from "../lib/permissions-context";
+import { useNotifications } from "../lib/notifications-context";
 import { supabase } from "../lib/supabase";
 
 const LINKEDIN_FIELDS = ['LINKEDIN_URL'];
 
+// Map display labels to DB field names
+const FIELD_LABEL_MAP = {
+  'LINKEDIN': 'LINKEDIN_URL',
+  'LINKEDIN URL': 'LINKEDIN_URL',
+  'LINKEDIN_URL': 'LINKEDIN_URL',
+};
+
+// Reverse map: DB field names to request labels
+const DB_TO_LABEL_MAP = {
+  LINKEDIN_URL: 'LINKEDIN',
+};
+
 export default function LinkedInPage() {
   const router = useRouter();
-  const { theme } = useContext(ThemeContext);
+  const { highlight } = useLocalSearchParams();
+  const { theme, isDark } = useContext(ThemeContext);
   const { studentData, setStudentData } = useStudent();
   const { isFieldEditable, hasAnyEditableField } = usePermissions();
+  const { markFieldComplete } = useNotifications();
   const [isEditing, setIsEditing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const pulseAnim = useRef(new Animated.Value(0)).current;
   const [stats, setStats] = useState({
     url: ''
   });
+
+  // Parse highlight fields from route params
+  const highlightFields = React.useMemo(() => {
+    if (!highlight) return new Set();
+    const fields = String(highlight).split(',').map(f => f.trim().toUpperCase());
+    const dbFields = fields.map(f => FIELD_LABEL_MAP[f] || f).filter(Boolean);
+    return new Set(dbFields);
+  }, [highlight]);
+
+  // Pulse animation for highlighted fields
+  useEffect(() => {
+    if (highlightFields.size > 0) {
+      Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseAnim, { toValue: 1, duration: 800, useNativeDriver: false }),
+          Animated.timing(pulseAnim, { toValue: 0, duration: 800, useNativeDriver: false }),
+        ])
+      ).start();
+    }
+  }, [highlightFields, pulseAnim]);
 
   const canEdit = hasAnyEditableField(LINKEDIN_FIELDS);
 
@@ -33,26 +69,39 @@ export default function LinkedInPage() {
     try {
       setSaving(true);
       const updates = {};
-      if (isFieldEditable('LINKEDIN_URL')) updates.LINKEDIN_URL = stats.url || null;
+      const updatedFields = [];
+
+      if (isFieldEditable('LINKEDIN_URL')) {
+        updates.LINKEDIN_URL = stats.url || null;
+        if (highlightFields.has('LINKEDIN_URL')) updatedFields.push('LINKEDIN_URL');
+      }
 
       const { data, error } = await supabase
         .from('Students')
         .update(updates)
-        .eq('EMAIL', studentData.EMAIL || studentData.email)
+        .eq('OFFICIAL_MAIL', studentData.OFFICIAL_MAIL || studentData.EMAIL || studentData.email)
         .select()
         .single();
 
       if (error) throw error;
+
+      // Mark highlighted fields as completed
+      const section = studentData.SECTION || studentData.section;
+      const regNo = studentData.REGNO || studentData.REG_NO || studentData.reg_no;
+      for (const dbField of updatedFields) {
+        const fieldLabel = DB_TO_LABEL_MAP[dbField] || dbField;
+        await markFieldComplete(section, regNo, fieldLabel);
+      }
       
       setStudentData(data);
       setIsEditing(false);
-      Alert.alert('Success', 'LinkedIn profile saved');
+      Alert.alert('Success', 'LinkedIn profile saved' + (updatedFields.length > 0 ? ` (${updatedFields.length} required field${updatedFields.length > 1 ? 's' : ''} updated)` : ''));
     } catch (e) {
       Alert.alert('Error', e.message);
     } finally {
       setSaving(false);
     }
-  }, [stats, studentData, setStudentData, isFieldEditable]);
+  }, [stats, studentData, setStudentData, isFieldEditable, highlightFields, markFieldComplete]);
 
   const updateField = (field, value) => {
     setStats(prev => ({ ...prev, [field]: value }));

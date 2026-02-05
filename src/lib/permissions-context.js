@@ -19,7 +19,6 @@ export function PermissionsProvider({ children }) {
         .select('*');
 
       if (error) {
-        console.error('Error fetching permissions:', error);
         // Default: all fields editable if table doesn't exist
         setPermissions({});
         return;
@@ -34,8 +33,7 @@ export function PermissionsProvider({ children }) {
         };
       });
       setPermissions(permsMap);
-    } catch (e) {
-      console.error('Permission fetch error:', e);
+    } catch (_e) {
       setPermissions({});
     } finally {
       setLoading(false);
@@ -43,10 +41,10 @@ export function PermissionsProvider({ children }) {
   };
 
   // Check if a specific field is editable
-  // Returns true by default if field not in permissions table (admin hasn't restricted it)
+  // Default to LOCKED unless explicitly allowed in field_permissions.
   const isFieldEditable = (fieldName) => {
-    if (!permissions[fieldName]) return true; // Default: editable if not specified
-    return permissions[fieldName].editable;
+    if (!permissions[fieldName]) return false; // Default: locked if not specified
+    return Boolean(permissions[fieldName].editable);
   };
 
   // Check if any field in a list is editable (for showing/hiding Edit button)

@@ -1,20 +1,47 @@
-import React, { useState, useEffect, useCallback, useContext } from "react";
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, TextInput, Alert } from "react-native";
-import { useRouter } from "expo-router";
+import React, { useState, useEffect, useCallback, useContext, useRef } from "react";
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, TextInput, Alert, Animated } from "react-native";
+import { useRouter, useLocalSearchParams } from "expo-router";
 import { ThemeContext } from "../lib/theme";
 import { useStudent } from "../lib/student-context";
 import { usePermissions } from "../lib/permissions-context";
+import { useNotifications } from "../lib/notifications-context";
 import { supabase } from "../lib/supabase";
 
 const CODECHEF_FIELDS = ['CODECHEF_ID', 'CC_TOTAL_PROBLEMS', 'CC_RANK', 'CC_BADGES', 'CC_RATING'];
 
+// Map display labels to DB field names
+const FIELD_LABEL_MAP = {
+  'CODECHEF': 'CODECHEF_ID',
+  'CODECHEF ID': 'CODECHEF_ID',
+  'CC TOTAL': 'CC_TOTAL_PROBLEMS',
+  'CC_TOTAL': 'CC_TOTAL_PROBLEMS',
+  'CC RANK': 'CC_RANK',
+  'CC_RANK': 'CC_RANK',
+  'CC BADGES': 'CC_BADGES',
+  'CC_BADGES': 'CC_BADGES',
+  'CC RATING': 'CC_RATING',
+  'CC_RATING': 'CC_RATING',
+};
+
+// Reverse map: DB field names to request labels
+const DB_TO_LABEL_MAP = {
+  CODECHEF_ID: 'CODECHEF ID',
+  CC_TOTAL_PROBLEMS: 'CC TOTAL',
+  CC_RANK: 'CC RANK',
+  CC_BADGES: 'CC BADGES',
+  CC_RATING: 'CC RATING',
+};
+
 export default function CodeChefPage() {
   const router = useRouter();
-  const { theme } = useContext(ThemeContext);
+  const { highlight } = useLocalSearchParams();
+  const { theme, isDark } = useContext(ThemeContext);
   const { studentData, setStudentData } = useStudent();
   const { isFieldEditable, hasAnyEditableField } = usePermissions();
+  const { markFieldComplete } = useNotifications();
   const [isEditing, setIsEditing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const pulseAnim = useRef(new Animated.Value(0)).current;
   const [stats, setStats] = useState({
     id: '',
     totalProblems: '',
@@ -22,6 +49,26 @@ export default function CodeChefPage() {
     badges: '',
     rating: ''
   });
+
+  // Parse highlight fields from route params
+  const highlightFields = React.useMemo(() => {
+    if (!highlight) return new Set();
+    const fields = String(highlight).split(',').map(f => f.trim().toUpperCase());
+    const dbFields = fields.map(f => FIELD_LABEL_MAP[f] || f).filter(Boolean);
+    return new Set(dbFields);
+  }, [highlight]);
+
+  // Pulse animation for highlighted fields
+  useEffect(() => {
+    if (highlightFields.size > 0) {
+      Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseAnim, { toValue: 1, duration: 800, useNativeDriver: false }),
+          Animated.timing(pulseAnim, { toValue: 0, duration: 800, useNativeDriver: false }),
+        ])
+      ).start();
+    }
+  }, [highlightFields, pulseAnim]);
 
   const canEdit = hasAnyEditableField(CODECHEF_FIELDS);
 
@@ -41,30 +88,55 @@ export default function CodeChefPage() {
     try {
       setSaving(true);
       const updates = {};
-      if (isFieldEditable('CODECHEF_ID')) updates.CODECHEF_ID = stats.id || null;
-      if (isFieldEditable('CC_TOTAL_PROBLEMS')) updates.CC_TOTAL_PROBLEMS = stats.totalProblems ? parseInt(stats.totalProblems) : null;
-      if (isFieldEditable('CC_RANK')) updates.CC_RANK = stats.rank ? parseInt(stats.rank) : null;
-      if (isFieldEditable('CC_BADGES')) updates.CC_BADGES = stats.badges ? parseInt(stats.badges) : null;
-      if (isFieldEditable('CC_RATING')) updates.CC_RATING = stats.rating ? parseInt(stats.rating) : null;
+      const updatedFields = [];
+
+      if (isFieldEditable('CODECHEF_ID')) {
+        updates.CODECHEF_ID = stats.id || null;
+        if (highlightFields.has('CODECHEF_ID')) updatedFields.push('CODECHEF_ID');
+      }
+      if (isFieldEditable('CC_TOTAL_PROBLEMS')) {
+        updates.CC_TOTAL_PROBLEMS = stats.totalProblems ? parseInt(stats.totalProblems) : null;
+        if (highlightFields.has('CC_TOTAL_PROBLEMS')) updatedFields.push('CC_TOTAL_PROBLEMS');
+      }
+      if (isFieldEditable('CC_RANK')) {
+        updates.CC_RANK = stats.rank ? parseInt(stats.rank) : null;
+        if (highlightFields.has('CC_RANK')) updatedFields.push('CC_RANK');
+      }
+      if (isFieldEditable('CC_BADGES')) {
+        updates.CC_BADGES = stats.badges ? parseInt(stats.badges) : null;
+        if (highlightFields.has('CC_BADGES')) updatedFields.push('CC_BADGES');
+      }
+      if (isFieldEditable('CC_RATING')) {
+        updates.CC_RATING = stats.rating ? parseInt(stats.rating) : null;
+        if (highlightFields.has('CC_RATING')) updatedFields.push('CC_RATING');
+      }
 
       const { data, error } = await supabase
         .from('Students')
         .update(updates)
-        .eq('EMAIL', studentData.EMAIL || studentData.email)
+        .eq('OFFICIAL_MAIL', studentData.OFFICIAL_MAIL || studentData.EMAIL || studentData.email)
         .select()
         .single();
 
       if (error) throw error;
+
+      // Mark highlighted fields as completed
+      const section = studentData.SECTION || studentData.section;
+      const regNo = studentData.REGNO || studentData.REG_NO || studentData.reg_no;
+      for (const dbField of updatedFields) {
+        const fieldLabel = DB_TO_LABEL_MAP[dbField] || dbField;
+        await markFieldComplete(section, regNo, fieldLabel);
+      }
       
       setStudentData(data);
       setIsEditing(false);
-      Alert.alert('Success', 'CodeChef stats saved');
+      Alert.alert('Success', 'CodeChef stats saved' + (updatedFields.length > 0 ? ` (${updatedFields.length} required field${updatedFields.length > 1 ? 's' : ''} updated)` : ''));
     } catch (e) {
       Alert.alert('Error', e.message);
     } finally {
       setSaving(false);
     }
-  }, [stats, studentData, setStudentData, isFieldEditable]);
+  }, [stats, studentData, setStudentData, isFieldEditable, highlightFields, markFieldComplete]);
 
   const updateField = (field, value) => {
     setStats(prev => ({ ...prev, [field]: value }));

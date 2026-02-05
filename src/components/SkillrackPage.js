@@ -1,25 +1,66 @@
-import React, { useState, useEffect, useCallback, useContext } from "react";
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, TextInput, Alert } from "react-native";
-import { useRouter } from "expo-router";
+import React, { useState, useEffect, useCallback, useContext, useRef } from "react";
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, TextInput, Alert, Animated } from "react-native";
+import { useRouter, useLocalSearchParams } from "expo-router";
 import { ThemeContext } from "../lib/theme";
 import { useStudent } from "../lib/student-context";
 import { usePermissions } from "../lib/permissions-context";
+import { useNotifications } from "../lib/notifications-context";
 import { supabase } from "../lib/supabase";
 
 const SKILLRACK_FIELDS = ['SKILLRACK_ID', 'SR_PROBLEMS_SOLVED', 'SR_RANK'];
 
+// Map display labels to DB field names
+const FIELD_LABEL_MAP = {
+  'SKILLRACK': 'SKILLRACK_ID',
+  'SKILLRACK ID': 'SKILLRACK_ID',
+  'SR PROBLEMS': 'SR_PROBLEMS_SOLVED',
+  'SR_PROBLEMS': 'SR_PROBLEMS_SOLVED',
+  'SR RANK': 'SR_RANK',
+  'SR_RANK': 'SR_RANK',
+};
+
+// Reverse map: DB field names to request labels
+const DB_TO_LABEL_MAP = {
+  SKILLRACK_ID: 'SKILLRACK ID',
+  SR_PROBLEMS_SOLVED: 'SR PROBLEMS',
+  SR_RANK: 'SR RANK',
+};
+
 export default function SkillrackPage() {
   const router = useRouter();
-  const { theme } = useContext(ThemeContext);
+  const { highlight } = useLocalSearchParams();
+  const { theme, isDark } = useContext(ThemeContext);
   const { studentData, setStudentData } = useStudent();
   const { isFieldEditable, hasAnyEditableField } = usePermissions();
+  const { markFieldComplete } = useNotifications();
   const [isEditing, setIsEditing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const pulseAnim = useRef(new Animated.Value(0)).current;
   const [stats, setStats] = useState({
     id: '',
     problemsSolved: '',
     rank: ''
   });
+
+  // Parse highlight fields from route params
+  const highlightFields = React.useMemo(() => {
+    if (!highlight) return new Set();
+    const fields = String(highlight).split(',').map(f => f.trim().toUpperCase());
+    const dbFields = fields.map(f => FIELD_LABEL_MAP[f] || f).filter(Boolean);
+    return new Set(dbFields);
+  }, [highlight]);
+
+  // Pulse animation for highlighted fields
+  useEffect(() => {
+    if (highlightFields.size > 0) {
+      Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseAnim, { toValue: 1, duration: 800, useNativeDriver: false }),
+          Animated.timing(pulseAnim, { toValue: 0, duration: 800, useNativeDriver: false }),
+        ])
+      ).start();
+    }
+  }, [highlightFields, pulseAnim]);
 
   const canEdit = hasAnyEditableField(SKILLRACK_FIELDS);
 
@@ -37,28 +78,47 @@ export default function SkillrackPage() {
     try {
       setSaving(true);
       const updates = {};
-      if (isFieldEditable('SKILLRACK_ID')) updates.SKILLRACK_ID = stats.id || null;
-      if (isFieldEditable('SR_PROBLEMS_SOLVED')) updates.SR_PROBLEMS_SOLVED = stats.problemsSolved ? parseInt(stats.problemsSolved) : null;
-      if (isFieldEditable('SR_RANK')) updates.SR_RANK = stats.rank ? parseInt(stats.rank) : null;
+      const updatedFields = [];
+
+      if (isFieldEditable('SKILLRACK_ID')) {
+        updates.SKILLRACK_ID = stats.id || null;
+        if (highlightFields.has('SKILLRACK_ID')) updatedFields.push('SKILLRACK_ID');
+      }
+      if (isFieldEditable('SR_PROBLEMS_SOLVED')) {
+        updates.SR_PROBLEMS_SOLVED = stats.problemsSolved ? parseInt(stats.problemsSolved) : null;
+        if (highlightFields.has('SR_PROBLEMS_SOLVED')) updatedFields.push('SR_PROBLEMS_SOLVED');
+      }
+      if (isFieldEditable('SR_RANK')) {
+        updates.SR_RANK = stats.rank ? parseInt(stats.rank) : null;
+        if (highlightFields.has('SR_RANK')) updatedFields.push('SR_RANK');
+      }
 
       const { data, error } = await supabase
         .from('Students')
         .update(updates)
-        .eq('EMAIL', studentData.EMAIL || studentData.email)
+        .eq('OFFICIAL_MAIL', studentData.OFFICIAL_MAIL || studentData.EMAIL || studentData.email)
         .select()
         .single();
 
       if (error) throw error;
+
+      // Mark highlighted fields as completed
+      const section = studentData.SECTION || studentData.section;
+      const regNo = studentData.REGNO || studentData.REG_NO || studentData.reg_no;
+      for (const dbField of updatedFields) {
+        const fieldLabel = DB_TO_LABEL_MAP[dbField] || dbField;
+        await markFieldComplete(section, regNo, fieldLabel);
+      }
       
       setStudentData(data);
       setIsEditing(false);
-      Alert.alert('Success', 'Skillrack stats saved');
+      Alert.alert('Success', 'Skillrack stats saved' + (updatedFields.length > 0 ? ` (${updatedFields.length} required field${updatedFields.length > 1 ? 's' : ''} updated)` : ''));
     } catch (e) {
       Alert.alert('Error', e.message);
     } finally {
       setSaving(false);
     }
-  }, [stats, studentData, setStudentData, isFieldEditable]);
+  }, [stats, studentData, setStudentData, isFieldEditable, highlightFields, markFieldComplete]);
 
   const updateField = (field, value) => {
     setStats(prev => ({ ...prev, [field]: value }));
