@@ -1,15 +1,18 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import {
   View,
   Text,
   StyleSheet,
-  TextInput,
   TouchableOpacity,
-  ScrollView,
   Alert,
   Dimensions,
+  ActivityIndicator,
+  Platform,
 } from "react-native";
 import { useRouter } from "expo-router";
+import * as WebBrowser from "expo-web-browser";
+import * as Linking from "expo-linking";
+// Use Linking to build a redirect URL that includes the Expo callback path
 import { supabase } from "../lib/supabase";
 import { useStudent } from "../lib/student-context";
 
@@ -22,10 +25,21 @@ try {
 
 const { height } = Dimensions.get("window");
 
-const ALLOWED_DOMAINS = ["@citchennai.net"]; // Organization email domains
+const ALLOWED_DOMAIN = "citchennai.net"; // Organization email domain
 
+// Required for OAuth to work properly on web
+WebBrowser.maybeCompleteAuthSession();
+
+// Build redirect URI that points to the app route handled by callback.tsx
+const redirectUri = Linking.createURL("/auth/callback");
+
+console.log("OAuth Redirect URI:", redirectUri);
+
+// Validate that email belongs to the organization domain
 const validateOrgEmail = (email) => {
-  return ALLOWED_DOMAINS.some((domain) => email.toLowerCase().endsWith(domain));
+  if (!email) return false;
+  const normalizedEmail = email.toLowerCase().trim();
+  return normalizedEmail.endsWith(`@${ALLOWED_DOMAIN}`);
 };
 
 // Decorative elements component
@@ -62,13 +76,150 @@ const DecorativeElements = () => (
   </>
 );
 
+// Google Icon component
+const GoogleIcon = () => (
+  <View style={styles.googleIconContainer}>
+    <Text style={styles.googleIconText}>G</Text>
+  </View>
+);
+
+// Helper function to extract params from URL
+const createSessionFromUrl = async (url) => {
+  console.log("Parsing URL for tokens:", url);
+  
+  // Try to get params from hash fragment first (Supabase uses this)
+  let params = {};
+  let errorDescription = null;
+  
+  if (url.includes("#")) {
+    const hashPart = url.split("#")[1];
+    if (hashPart) {
+      const hashParams = new URLSearchParams(hashPart);
+      params.access_token = hashParams.get("access_token");
+      params.refresh_token = hashParams.get("refresh_token");
+      // Check for error in hash
+      errorDescription = hashParams.get("error_description") || hashParams.get("error");
+    }
+  }
+  
+  // Also try query params
+  if (!params.access_token && url.includes("?")) {
+    const queryPart = url.split("?")[1]?.split("#")[0];
+    if (queryPart) {
+      const queryParams = new URLSearchParams(queryPart);
+      params.access_token = queryParams.get("access_token");
+      params.refresh_token = queryParams.get("refresh_token");
+      // Check for error in query
+      if (!errorDescription) {
+        errorDescription = queryParams.get("error_description") || queryParams.get("error");
+      }
+    }
+  }
+
+  console.log("Parsed params - access_token:", !!params.access_token, "error:", errorDescription);
+
+  if (errorDescription) {
+    return { data: null, error: new Error(decodeURIComponent(errorDescription)) };
+  }
+
+  if (params.access_token) {
+    const { data, error } = await supabase.auth.setSession({
+      access_token: params.access_token,
+      refresh_token: params.refresh_token || "",
+    });
+    return { data, error };
+  }
+  
+  return { data: null, error: new Error("No access token found in URL") };
+};
+
 export default function LoginPage() {
   const router = useRouter();
   const { setStudentData } = useStudent();
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
-  const [isSignUp, setIsSignUp] = useState(false);
+
+  // Function to handle successful authentication
+  const handleAuthSuccess = async (url) => {
+    console.log("Processing auth URL:", url);
+    
+    try {
+      // Extract and set session from the URL
+      const { error: sessionError } = await createSessionFromUrl(url);
+
+      if (sessionError) {
+        console.error("Session error:", sessionError);
+        Alert.alert("Authentication Error", sessionError.message || "Failed to create session");
+        setLoading(false);
+        return;
+      }
+
+      // Get the user to validate their email domain
+      const { data: userData, error: userError } = await supabase.auth.getUser();
+
+      if (userError || !userData?.user) {
+        console.error("User error:", userError);
+        Alert.alert("Error", "Failed to get user information");
+        setLoading(false);
+        return;
+      }
+
+      const userEmail = userData.user.email;
+      console.log("User email:", userEmail);
+
+      // Validate that the email belongs to the organization
+      if (!validateOrgEmail(userEmail)) {
+        await supabase.auth.signOut();
+        Alert.alert(
+          "Access Denied",
+          `Only @${ALLOWED_DOMAIN} email addresses are allowed. Please sign in with your organization email.`
+        );
+        setLoading(false);
+        return;
+      }
+
+      // Save user session
+      if (AsyncStorage) {
+        await AsyncStorage.setItem("@arc_user", JSON.stringify(userData.user));
+      }
+
+      // Check if this user has the STUDENT role
+      try {
+        const { data: profile, error: profileErr } = await supabase
+          .from("profiles")
+          .select("role")
+          .eq("user_id", userData.user.id)
+          .maybeSingle();
+
+        if (profileErr) {
+          console.warn("Profile lookup failed", profileErr.message || profileErr);
+        }
+
+        const dbRole = profile?.role ? String(profile.role).toUpperCase() : null;
+
+        if (!profile || dbRole !== "STUDENT") {
+          Alert.alert(
+            "Account Not Allowed",
+            "This account is not set up for the student app. If you are a student, contact your administrator to link your account. Admins should use the web portal."
+          );
+          await supabase.auth.signOut();
+          setLoading(false);
+          return;
+        }
+      } catch (_e) {
+        // Continue even if profile check fails
+      }
+
+      // Fetch student details
+      await fetchStudentDetails(userEmail);
+
+      // Navigate to student dashboard
+      setLoading(false);
+      router.replace("/student");
+    } catch (error) {
+      console.error("Auth success handling error:", error);
+      setLoading(false);
+    }
+  };
 
   const fetchStudentDetails = async (userEmail) => {
     const normalized = String(userEmail || "")
@@ -100,128 +251,136 @@ export default function LoginPage() {
     }
   };
 
-  const handleLogin = async () => {
-    if (!email || !password) {
-      Alert.alert("Error", "Please fill in all fields");
-      return;
-    }
-    const normalizedEmail = String(email || "")
-      .trim()
-      .toLowerCase();
-
-    if (!validateOrgEmail(normalizedEmail)) {
-      Alert.alert(
-        "Error",
-        `Please use an organization email (${ALLOWED_DOMAINS.join(", ")})`
-      );
-      return;
-    }
-
+  const handleGoogleSignIn = async () => {
     setLoading(true);
     try {
-      const { data, error } = await supabase.auth.signInWithPassword({
-        email: normalizedEmail,
-        password,
+      console.log("Starting Google Sign-In with redirect URI:", redirectUri);
+      
+      // Get the OAuth URL from Supabase with domain restriction hint
+      const { data, error } = await supabase.auth.signInWithOAuth({
+        provider: "google",
+        options: {
+          redirectTo: redirectUri,
+          queryParams: {
+            // Restrict to organization domain
+            hd: ALLOWED_DOMAIN,
+            prompt: "select_account",
+          },
+          skipBrowserRedirect: true,
+        },
       });
 
       if (error) {
-        Alert.alert("Login Error", error.message);
-      } else if (data?.user) {
-        // Save user session
-        if (AsyncStorage) {
-          await AsyncStorage.setItem("@arc_user", JSON.stringify(data.user));
-        }
-
-        // Ensure this auth account maps to a STUDENT profile. If the
-        // profile role is SECTION_ADVISOR or HOD, this account is for the
-        // admin web portal — show an alert and do not proceed to student UI.
-        try {
-          const { data: profile, error: profileErr } = await supabase
-            .from("profiles")
-            .select("role")
-            .eq("user_id", data.user.id)
-            .maybeSingle();
-
-          if (profileErr) {
-            console.warn(
-              "Profile lookup failed",
-              profileErr.message || profileErr
-            );
-          }
-
-          const dbRole = profile?.role
-            ? String(profile.role).toUpperCase()
-            : null;
-          if (!profile || dbRole !== "STUDENT") {
-            Alert.alert(
-              "Account Not Allowed",
-              "This account is not set up for the student app. If you are a student, contact your administrator to link your account. Admins should use the web portal."
-            );
-            try {
-              await supabase.auth.signOut();
-            } catch (_e) {}
-            return;
-          }
-        } catch (_e) {
-          // ignore and continue
-        }
-
-        // Fetch student details if available (do not block login).
-        await fetchStudentDetails(normalizedEmail);
-
-        // Auth success == logged in, even if no Students record exists.
-        router.replace("/student");
+        console.error("OAuth error:", error);
+        Alert.alert("Error", error.message);
+        setLoading(false);
+        return;
       }
-    } catch (_e) {
-      Alert.alert("Error", "Login failed. Please try again.");
-    } finally {
+
+      if (data?.url) {
+        console.log("Opening auth URL:", data.url);
+        
+        // Use WebBrowser.openAuthSessionAsync which works with Expo Auth Proxy
+        const result = await WebBrowser.openAuthSessionAsync(
+          data.url,
+          redirectUri
+        );
+
+        console.log("Auth result:", result);
+
+        if (result.type === "success" && result.url) {
+          console.log("Success! Received URL:", result.url);
+          await handleAuthSuccess(result.url);
+        } else if (result.type === "cancel" || result.type === "dismiss") {
+          console.log("User cancelled login");
+          setLoading(false);
+        } else {
+          console.log("Auth result type:", result.type);
+          setLoading(false);
+        }
+      }
+    } catch (error) {
+      console.error("Google sign-in error:", error);
+      Alert.alert("Error", "Failed to sign in with Google. Please try again.");
       setLoading(false);
     }
   };
 
-  const handleSignUp = async () => {
-    if (!email || !password) {
-      Alert.alert("Error", "Please fill in all fields");
-      return;
-    }
-    const normalizedEmail = String(email || "")
-      .trim()
-      .toLowerCase();
+  // Listen for deep links (OAuth callback) and check existing session
+  useEffect(() => {
+    let isMounted = true;
 
-    if (!validateOrgEmail(normalizedEmail)) {
-      Alert.alert(
-        "Error",
-        `Please use an organization email (${ALLOWED_DOMAINS.join(", ")})`
-      );
-      return;
-    }
-
-    setLoading(true);
-    try {
-      const { data, error } = await supabase.auth.signUp({
-        email: normalizedEmail,
-        password,
-      });
-
-      if (error) {
-        Alert.alert("Sign Up Error", error.message);
-      } else if (data?.user) {
-        Alert.alert("Success", "Account created! Please log in.");
-        setIsSignUp(false);
-        setEmail("");
-        setPassword("");
+    // Handle incoming URL (deep link from OAuth)
+    const handleUrl = async (event) => {
+      const url = typeof event === 'string' ? event : event?.url;
+      if (!url) return;
+      
+      console.log("Received deep link URL:", url);
+      
+      // Check if this URL contains auth tokens
+      if (url.includes("access_token") || url.includes("#access_token")) {
+        setLoading(true);
+        await handleAuthSuccess(url);
       }
-    } catch (_e) {
-      Alert.alert("Error", "Sign up failed. Please try again.");
-    } finally {
-      setLoading(false);
-    }
-  };
+    };
+
+    // Check for initial URL (app opened via deep link)
+    const checkInitialUrl = async () => {
+      const initialUrl = await Linking.getInitialURL();
+      if (initialUrl) {
+        console.log("Initial URL:", initialUrl);
+        await handleUrl(initialUrl);
+      }
+    };
+
+    // Check existing session
+    const checkSession = async () => {
+      const { data } = await supabase.auth.getSession();
+      if (data?.session?.user) {
+        const userEmail = data.session.user.email;
+        if (validateOrgEmail(userEmail)) {
+          // Check role before auto-redirecting
+          try {
+            const { data: profile } = await supabase
+              .from("profiles")
+              .select("role")
+              .eq("user_id", data.session.user.id)
+              .maybeSingle();
+
+            const dbRole = profile?.role
+              ? String(profile.role).toUpperCase()
+              : null;
+
+            if (profile && dbRole === "STUDENT") {
+              await fetchStudentDetails(userEmail);
+              if (isMounted) router.replace("/student");
+            }
+          } catch (_e) {
+            // Ignore errors
+          }
+        } else {
+          // Sign out if email doesn't match organization domain
+          await supabase.auth.signOut();
+        }
+      }
+    };
+
+    checkInitialUrl();
+    checkSession();
+
+    // Listen for URL events (deep links while app is open)
+    const subscription = Linking.addEventListener("url", handleUrl);
+
+    return () => {
+      isMounted = false;
+      subscription.remove();
+    };
+  }, []);
 
   return (
     <View style={styles.root}>
-      {/* Orange gradient background section */}
-      <View style={styles.orangeSection}>
+      {/* Purple gradient background section */}
+      <View style={styles.purpleSection}>
         <DecorativeElements />
 
         {/* Logo/Brand area */}
@@ -233,80 +392,40 @@ export default function LoginPage() {
 
       {/* White card section */}
       <View style={styles.whiteSection}>
-        <ScrollView
-          contentContainerStyle={styles.scrollContent}
-          showsVerticalScrollIndicator={false}
-          keyboardShouldPersistTaps="handled"
-        >
-          <Text style={styles.title}>
-            {isSignUp ? "Create Account" : "Log in"}
-          </Text>
+        <View style={styles.contentContainer}>
+          <Text style={styles.title}>Welcome</Text>
           <Text style={styles.subtitle}>
-            {isSignUp
-              ? "Sign up with your organization email"
-              : "By logging in, you agree to our Terms of Use."}
+            Sign in with your organization Google account to continue
           </Text>
 
-          <View style={styles.inputGroup}>
-            <Text style={styles.label}>Email</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="Your email"
-              placeholderTextColor="#9ca3af"
-              value={email}
-              onChangeText={setEmail}
-              editable={!loading}
-              keyboardType="email-address"
-              autoCapitalize="none"
-            />
-            <Text style={styles.helperText}>
-              Use your @citchennai.net email
+          <View style={styles.domainNote}>
+            <Text style={styles.domainNoteText}>
+              Only @{ALLOWED_DOMAIN} accounts are allowed
             </Text>
           </View>
 
-          <View style={styles.inputGroup}>
-            <Text style={styles.label}>Password</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="••••••••"
-              placeholderTextColor="#9ca3af"
-              value={password}
-              onChangeText={setPassword}
-              editable={!loading}
-              secureTextEntry
-            />
-          </View>
-
           <TouchableOpacity
-            style={[styles.button, loading && styles.buttonDisabled]}
-            onPress={isSignUp ? handleSignUp : handleLogin}
+            style={[styles.googleButton, loading && styles.buttonDisabled]}
+            onPress={handleGoogleSignIn}
             disabled={loading}
           >
-            <Text style={styles.buttonText}>
-              {loading ? "Loading..." : isSignUp ? "Sign Up" : "Connect"}
-            </Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={styles.toggleButton}
-            onPress={() => {
-              setIsSignUp(!isSignUp);
-              setEmail("");
-              setPassword("");
-            }}
-          >
-            <Text style={styles.toggleText}>
-              {isSignUp
-                ? "Already have an account? Sign In"
-                : "Don't have an account? Sign Up"}
-            </Text>
+            {loading ? (
+              <ActivityIndicator color="#1f2937" size="small" />
+            ) : (
+              <>
+                <GoogleIcon />
+                <Text style={styles.googleButtonText}>
+                  Sign in with Google
+                </Text>
+              </>
+            )}
           </TouchableOpacity>
 
           <Text style={styles.footer}>
             For more information, please see{" "}
             <Text style={styles.footerLink}>Privacy policy</Text>.
           </Text>
-        </ScrollView>
+        </View>
       </View>
     </View>
   );
@@ -317,7 +436,7 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: "#7c3aed",
   },
-  orangeSection: {
+  purpleSection: {
     height: height * 0.4,
     backgroundColor: "#7c3aed",
     position: "relative",
@@ -367,103 +486,88 @@ const styles = StyleSheet.create({
     borderTopLeftRadius: 32,
     borderTopRightRadius: 32,
     marginTop: -24,
-    paddingTop: 32,
+    paddingTop: 40,
     paddingHorizontal: 24,
   },
-  scrollContent: {
-    flexGrow: 1,
-    paddingBottom: 40,
+  contentContainer: {
+    flex: 1,
+    justifyContent: "flex-start",
+    paddingTop: 20,
   },
   title: {
     fontSize: 28,
     fontWeight: "700",
     color: "#1f2937",
     marginBottom: 8,
+    textAlign: "center",
   },
   subtitle: {
     fontSize: 14,
     color: "#6b7280",
-    marginBottom: 28,
+    marginBottom: 24,
     lineHeight: 20,
+    textAlign: "center",
   },
-  inputGroup: {
-    marginBottom: 20,
+  domainNote: {
+    backgroundColor: "#f3f4f6",
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    marginBottom: 32,
+    alignItems: "center",
   },
-  label: {
+  domainNoteText: {
     fontSize: 13,
-    fontWeight: "600",
-    color: "#6b7280",
-    marginBottom: 8,
+    color: "#4b5563",
+    fontWeight: "500",
   },
-  input: {
+  googleButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#fff",
     borderWidth: 1,
     borderColor: "#e5e7eb",
-    borderRadius: 14,
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    fontSize: 16,
-    color: "#1f2937",
-    backgroundColor: "#fff",
-  },
-  helperText: {
-    fontSize: 12,
-    color: "#9ca3af",
-    marginTop: 6,
-  },
-  button: {
-    backgroundColor: "#7c3aed",
     borderRadius: 16,
     paddingVertical: 16,
-    alignItems: "center",
-    marginTop: 8,
-    shadowColor: "#7c3aed",
-    shadowOpacity: 0.25,
-    shadowRadius: 12,
-    shadowOffset: { width: 0, height: 6 },
-    elevation: 6,
+    paddingHorizontal: 24,
+    shadowColor: "#000",
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 2,
   },
   buttonDisabled: {
     opacity: 0.6,
   },
-  buttonText: {
-    color: "#fff",
-    fontSize: 17,
-    fontWeight: "600",
-  },
-  toggleButton: {
-    marginTop: 20,
+  googleIconContainer: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: "#4285F4",
     alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
   },
-  toggleText: {
-    color: "#7c3aed",
+  googleIconText: {
+    color: "#fff",
     fontSize: 14,
+    fontWeight: "700",
+  },
+  googleButtonText: {
+    color: "#1f2937",
+    fontSize: 16,
     fontWeight: "600",
   },
   footer: {
     textAlign: "center",
     color: "#9ca3af",
     fontSize: 12,
-    marginTop: 24,
+    marginTop: 40,
     lineHeight: 18,
   },
   footerLink: {
     color: "#1f2937",
     fontWeight: "600",
-  },
-  debugBox: {
-    marginTop: 18,
-    padding: 12,
-    borderRadius: 12,
-    backgroundColor: "#f3f4f6",
-  },
-  debugTitle: {
-    fontSize: 14,
-    fontWeight: "700",
-    marginBottom: 6,
-  },
-  debugText: {
-    fontSize: 12,
-    color: "#374151",
-    marginBottom: 4,
   },
 });
